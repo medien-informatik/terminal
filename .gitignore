@@ -1,0 +1,5 @@
+.claude
+node_modules
+dist
+packages/core/src/wasm-inline.ts
+public/pyodide

@@ -1,0 +1,30 @@
+{
+  "name": "wterm-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Lokale wterm-Simulation (Browser-only Bash via just-bash) mit nano-Emulation",
+  "license": "Apache-2.0",
+  "scripts": {
+    "inline-wasm": "node scripts/inline-wasm.mjs",
+    "predev": "npm run prepare-assets",
+    "dev": "vite",
+    "prebuild": "npm run prepare-assets",
+    "build": "vite build",
+    "preview": "vite preview",
+    "type-check": "tsc --noEmit",
+    "prepare-assets": "node scripts/inline-wasm.mjs && node scripts/copy-pyodide.mjs"
+  },
+  "dependencies": {
+    "diff": "^9.0.0",
+    "isomorphic-git": "^1.44.12",
+    "just-bash": "^3.4.2",
+    "pyodide": "^314.0.7",
+    "string-width": "^8.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^6.3.5",
+    "vite-plugin-node-polyfills": "^0.26.0"
+  }
+}

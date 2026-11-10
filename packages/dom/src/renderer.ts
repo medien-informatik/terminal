@@ -1,0 +1,1879 @@
+import type {
+  CellData,
+  CursorState,
+  TerminalCore,
+  TerminalPosition,
+  TerminalColorOverrides,
+} from "@wterm/core";
+import { GraphicsLayer, type GraphicsLayerOptions } from "./graphics-layer.js";
+import { GpuGrid, type GpuCursor, type GpuPalette } from "./gpu-renderer.js";
+import {
+  getSelectionText,
+  offsetAtCell,
+  textPoint,
+  type RenderedRowText,
+} from "./selection.js";
+import { selectionRange, type SelectionUnit } from "./selection-range.js";
+import { rectangleSelection } from "./rectangle-selection.js";
+import { markSelectionChanged, selectionMayExist } from "./selection-state.js";
+import {
+  TrackedSelection,
+  MAX_TRACKED_SELECTION_ROWS,
+} from "./tracked-selection.js";
+
+const DEFAULT_COLOR = 256;
+const DEFAULT_FG_CSS = "var(--term-app-fg, var(--term-fg))";
+const DEFAULT_BG_CSS = "var(--term-app-bg, var(--term-bg))";
+const FLAG_BOLD = 0x01;
+const FLAG_DIM = 0x02;
+const FLAG_ITALIC = 0x04;
+const FLAG_UNDERLINE = 0x08;
+const FLAG_REVERSE = 0x20;
+const FLAG_INVISIBLE = 0x40;
+const FLAG_STRIKETHROUGH = 0x80;
+const DEFAULT_SCROLLBACK_OVERSCAN_ROWS = 10;
+
+export interface RenderViewport {
+  scrollTop: number;
+  clientHeight: number;
+  rowHeight: number;
+  overscanRows?: number;
+  scrollbackDiscardedCount?: number;
+  charWidth?: number;
+  selectedRows?: { start: number; end: number };
+  /** Following live output at the bottom; lets the GPU path paint the grid. */
+  live?: boolean;
+}
+
+function rgbToCSS(packed: number): string {
+  const r = (packed >> 16) & 0xff;
+  const g = (packed >> 8) & 0xff;
+  const b = packed & 0xff;
+  return `rgb(${r},${g},${b})`;
+}
+
+function colorToCSS(index: number): string | null {
+  if (index === DEFAULT_COLOR) return null;
+  if (index < 16) return `var(--term-color-${index})`;
+  return rgbToCSS(paletteRgb(index));
+}
+
+/** Packed RGB for xterm palette indices 16-255. */
+function paletteRgb(index: number): number {
+  if (index < 232) {
+    const n = index - 16;
+    return (
+      ((Math.floor(n / 36) * 51) << 16) |
+      (((Math.floor(n / 6) % 6) * 51) << 8) |
+      ((n % 6) * 51)
+    );
+  }
+  const level = (index - 232) * 10 + 8;
+  return (level << 16) | (level << 8) | level;
+}
+
+const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+
+function cellColorPixel(
+  index: number,
+  rgb: number | undefined,
+): number | undefined {
+  if (rgb === undefined) {
+    if (index < 16 || index > 255) return undefined;
+    rgb = paletteRgb(index);
+  }
+  return LITTLE_ENDIAN
+    ? (0xff000000 |
+        ((rgb & 0xff) << 16) |
+        (rgb & 0xff00) |
+        ((rgb >>> 16) & 0xff)) >>>
+        0
+    : ((rgb << 8) | 0xff) >>> 0;
+}
+
+function cellFgCSS(fg: number, fgRgb: number | undefined): string | null {
+  if (fgRgb !== undefined) return rgbToCSS(fgRgb);
+  return colorToCSS(fg);
+}
+
+function cellBgCSS(bg: number, bgRgb: number | undefined): string | null {
+  if (bgRgb !== undefined) return rgbToCSS(bgRgb);
+  return colorToCSS(bg);
+}
+
+function cellBackgroundPixel(cell: CellData): number | undefined {
+  return cell.flags & FLAG_REVERSE
+    ? cellColorPixel(cell.fg, cell.fgRgb)
+    : cellColorPixel(cell.bg, cell.bgRgb);
+}
+
+function buildCellStyle(
+  { fg, bg, flags, fgRgb, bgRgb, underlineStyle, underlineRgb }: CellData,
+  includeBackground = true,
+): string {
+  const reverse = flags & FLAG_REVERSE;
+  const fgCSS = reverse
+    ? (cellBgCSS(bg, bgRgb) ?? DEFAULT_BG_CSS)
+    : cellFgCSS(fg, fgRgb);
+  const bgCSS = includeBackground
+    ? reverse
+      ? (cellFgCSS(fg, fgRgb) ?? DEFAULT_FG_CSS)
+      : cellBgCSS(bg, bgRgb)
+    : null;
+
+  let style = "";
+  if (fgCSS) style += `color:${fgCSS};`;
+  if (bgCSS) style += `background:${bgCSS};`;
+  if (flags & FLAG_BOLD) style += "font-weight:bold;";
+  if (flags & FLAG_DIM) style += "opacity:0.5;";
+  if (flags & FLAG_ITALIC) style += "font-style:italic;";
+
+  const decorations: string[] = [];
+  const underline =
+    underlineStyle ?? (flags & FLAG_UNDERLINE ? "single" : "none");
+  if (underline !== "none") decorations.push("underline");
+  if (flags & FLAG_STRIKETHROUGH) decorations.push("line-through");
+  if (decorations.length) style += `text-decoration:${decorations.join(" ")};`;
+  if (underline !== "none") {
+    const cssStyle =
+      underline === "curly"
+        ? "wavy"
+        : underline === "double" ||
+            underline === "dotted" ||
+            underline === "dashed"
+          ? underline
+          : "solid";
+    style += `text-decoration-style:${cssStyle};text-decoration-skip-ink:none;`;
+    if (underlineRgb !== undefined)
+      style += `text-decoration-color:${rgbToCSS(underlineRgb)};`;
+  }
+
+  if (flags & FLAG_INVISIBLE) style += "visibility:hidden;";
+  return style;
+}
+
+// Cell colors are normally inline styles so each run can be painted without
+// extra classes. Cursor styles need to remain overridable by the focused
+// cursor rule, though, so move only those two declarations to custom
+// properties when a cursor span reuses a cell style.
+function cursorCellStyle(style: string): string {
+  return style
+    .replace(/(^|;)color:/g, "$1--term-cell-fg:")
+    .replace(/(^|;)background:/g, "$1--term-cell-bg:");
+}
+
+function columnStyle(columns: number): string {
+  return columns === 1 ? "" : `--term-span-cols:${columns};`;
+}
+
+function appendRun(parent: HTMLElement, text: string, style: string): void {
+  const span = document.createElement("span");
+  if (style) span.style.cssText = style;
+  span.textContent = text;
+  parent.appendChild(span);
+}
+
+function escapeHTML(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+interface RowPart {
+  html: string;
+  /** Flat spans can keep their element and text node when only text changes. */
+  opening?: string;
+  text?: string;
+}
+
+// CSS applies one decoration style/color to every line on an element. Keep
+// the strike on its own inline element so colored/curly underlines do not
+// change it. The cell span still owns geometry and the text appears only once.
+function cellSpanPart(className: string, style: string, text: string): RowPart {
+  let content = escapeHTML(text);
+  const flat = !style.includes("text-decoration:underline line-through;");
+  if (!flat) {
+    style = style.replace(
+      "text-decoration:underline line-through;",
+      "text-decoration:underline;",
+    );
+    content = `<span style="text-decoration:line-through solid currentColor;">${content}</span>`;
+  }
+  const classAttr = className ? ` class="${className}"` : "";
+  const styleAttr = style ? ` style="${style}"` : "";
+  const opening = `<span${classAttr}${styleAttr}>`;
+  return {
+    html: `${opening}${content}</span>`,
+    opening: flat ? opening : undefined,
+    text: flat ? text : undefined,
+  };
+}
+
+function safeLinkHref(uri: string | undefined): string | undefined {
+  if (!uri) return undefined;
+  try {
+    const url = new URL(uri);
+    return url.protocol === "http:" || url.protocol === "https:"
+      ? url.href
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function linkIdentity(cell: CellData): string {
+  if (!cell.linkUri) return "";
+  return cell.linkKey ?? `fallback\0${cell.linkId ?? ""}\0${cell.linkUri}`;
+}
+
+function resolveColors(
+  fg: number,
+  bg: number,
+  flags: number,
+  fgRgb?: number,
+  bgRgb?: number,
+): { fg: string; bg: string } {
+  const foreground = cellFgCSS(fg, fgRgb) || DEFAULT_FG_CSS;
+  const background = cellBgCSS(bg, bgRgb) || DEFAULT_BG_CSS;
+  return flags & FLAG_REVERSE
+    ? { fg: background, bg: foreground }
+    : { fg: foreground, bg: background };
+}
+
+// Pixel-snapped vertical gradient stops keyed off `--term-row-height` so that
+// every cell paints the eighth-block boundary on the same physical pixel —
+// using raw percentages (e.g. `12.5%`) at the canonical 17px row-height
+// resolves to 2.125px and the browser rounds it differently across cells,
+// producing the per-cell jog Claude Code's horizontal-rule (`▔▔▔▔▔`) makes
+// visible against the row immediately below.
+const SNAP_1_8 = "round(calc(var(--term-row-height) * 0.125), 1px)";
+const SNAP_2_8 = "round(calc(var(--term-row-height) * 0.25), 1px)";
+const SNAP_3_8 = "round(calc(var(--term-row-height) * 0.375), 1px)";
+const SNAP_4_8 = "round(calc(var(--term-row-height) * 0.5), 1px)";
+const SNAP_5_8 = "round(calc(var(--term-row-height) * 0.625), 1px)";
+const SNAP_6_8 = "round(calc(var(--term-row-height) * 0.75), 1px)";
+const SNAP_7_8 = "round(calc(var(--term-row-height) * 0.875), 1px)";
+
+function getBlockBackground(cp: number, fg: string, bg: string): string {
+  switch (cp) {
+    case 0x2580:
+      return `linear-gradient(${fg} ${SNAP_4_8},${bg} ${SNAP_4_8})`;
+    case 0x2581:
+      return `linear-gradient(${bg} ${SNAP_7_8},${fg} ${SNAP_7_8})`;
+    case 0x2582:
+      return `linear-gradient(${bg} ${SNAP_6_8},${fg} ${SNAP_6_8})`;
+    case 0x2583:
+      return `linear-gradient(${bg} ${SNAP_5_8},${fg} ${SNAP_5_8})`;
+    case 0x2584:
+      return `linear-gradient(${bg} ${SNAP_4_8},${fg} ${SNAP_4_8})`;
+    case 0x2585:
+      return `linear-gradient(${bg} ${SNAP_3_8},${fg} ${SNAP_3_8})`;
+    case 0x2586:
+      return `linear-gradient(${bg} ${SNAP_2_8},${fg} ${SNAP_2_8})`;
+    case 0x2587:
+      return `linear-gradient(${bg} ${SNAP_1_8},${fg} ${SNAP_1_8})`;
+    case 0x2588:
+      return fg;
+    case 0x2589:
+      return `linear-gradient(to right,${fg} 87.5%,${bg} 87.5%)`;
+    case 0x258a:
+      return `linear-gradient(to right,${fg} 75%,${bg} 75%)`;
+    case 0x258b:
+      return `linear-gradient(to right,${fg} 62.5%,${bg} 62.5%)`;
+    case 0x258c:
+      return `linear-gradient(to right,${fg} 50%,${bg} 50%)`;
+    case 0x258d:
+      return `linear-gradient(to right,${fg} 37.5%,${bg} 37.5%)`;
+    case 0x258e:
+      return `linear-gradient(to right,${fg} 25%,${bg} 25%)`;
+    case 0x258f:
+      return `linear-gradient(to right,${fg} 12.5%,${bg} 12.5%)`;
+    case 0x2590:
+      return `linear-gradient(to right,${bg} 50%,${fg} 50%)`;
+    case 0x2591:
+      return `color-mix(in srgb,${fg} 25%,${bg})`;
+    case 0x2592:
+      return `color-mix(in srgb,${fg} 50%,${bg})`;
+    case 0x2593:
+      return `color-mix(in srgb,${fg} 75%,${bg})`;
+    case 0x2594:
+      return `linear-gradient(${fg} ${SNAP_1_8},${bg} ${SNAP_1_8})`;
+    case 0x2595:
+      return `linear-gradient(to right,${bg} 87.5%,${fg} 87.5%)`;
+    default: {
+      const QUADRANTS: Record<number, [boolean, boolean, boolean, boolean]> = {
+        0x2596: [false, false, true, false],
+        0x2597: [false, false, false, true],
+        0x2598: [true, false, false, false],
+        0x2599: [true, false, true, true],
+        0x259a: [true, false, false, true],
+        0x259b: [true, true, true, false],
+        0x259c: [true, true, false, true],
+        0x259d: [false, true, false, false],
+        0x259e: [false, true, true, false],
+        0x259f: [false, true, true, true],
+      };
+      const q = QUADRANTS[cp];
+      if (!q) return fg;
+      const [tl, tr, bl, br] = q;
+      if (tl && tr && bl && br) return fg;
+      const layers: string[] = [];
+      const POS = ["0 0", "100% 0", "0 100%", "100% 100%"];
+      q.forEach((filled, i) => {
+        if (filled)
+          layers.push(
+            `linear-gradient(${fg},${fg}) ${POS[i]}/50% 50% no-repeat`,
+          );
+      });
+      layers.push(bg);
+      return layers.join(",");
+    }
+  }
+}
+
+// Keep box characters as text for selection and copy while painting their
+// strokes to cell edges. Some fallback fonts leave gaps at those boundaries.
+const LIGHT_BOX_ARMS: Record<number, string> = {
+  0x2500: "lr", // ─
+  0x2502: "ud", // │
+  0x250c: "dr", // ┌
+  0x2510: "dl", // ┐
+  0x2514: "ur", // └
+  0x2518: "ul", // ┘
+  0x251c: "udr", // ├
+  0x2524: "udl", // ┤
+  0x252c: "dlr", // ┬
+  0x2534: "ulr", // ┴
+  0x253c: "udlr", // ┼
+  0x2574: "l", // ╴
+  0x2575: "u", // ╵
+  0x2576: "r", // ╶
+  0x2577: "d", // ╷
+};
+const HEAVY_BOX_ARMS: Record<number, string> = {
+  0x2501: "lr", // ━
+  0x2503: "ud", // ┃
+  0x250f: "dr", // ┏
+  0x2513: "dl", // ┓
+  0x2517: "ur", // ┗
+  0x251b: "ul", // ┛
+  0x2523: "udr", // ┣
+  0x252b: "udl", // ┫
+  0x2533: "dlr", // ┳
+  0x253b: "ulr", // ┻
+  0x254b: "udlr", // ╋
+  0x2578: "l", // ╸
+  0x2579: "u", // ╹
+  0x257a: "r", // ╺
+  0x257b: "d", // ╻
+};
+const ROUNDED_BOX_CORNERS: Record<number, string> = {
+  0x256d: "tl", // ╭
+  0x256e: "tr", // ╮
+  0x256f: "br", // ╯
+  0x2570: "bl", // ╰
+};
+
+type BoxStyle = { className: string; style: string };
+const BOX_STYLES: Record<number, BoxStyle> = {};
+
+function addBoxStyles(
+  characters: Record<number, string>,
+  className: string,
+): void {
+  const stroke = "var(--term-box-stroke)";
+  const verticalLength = `calc(50% + ${stroke})`;
+  const horizontalLength = `calc(50% + ${stroke})`;
+  for (const [codepoint, arms] of Object.entries(characters)) {
+    const selected: [position: string, size: string][] = [];
+    if (arms.includes("u") && arms.includes("d")) {
+      selected.push(["center center", `${stroke} 100%`]);
+    } else {
+      if (arms.includes("u"))
+        selected.push(["center top", `${stroke} ${verticalLength}`]);
+      if (arms.includes("d"))
+        selected.push(["center bottom", `${stroke} ${verticalLength}`]);
+    }
+    if (arms.includes("l") && arms.includes("r")) {
+      selected.push(["center center", `100% ${stroke}`]);
+    } else {
+      if (arms.includes("l"))
+        selected.push(["left center", `${horizontalLength} ${stroke}`]);
+      if (arms.includes("r"))
+        selected.push(["right center", `${horizontalLength} ${stroke}`]);
+    }
+    BOX_STYLES[Number(codepoint)] = {
+      className,
+      style: `background-image:${selected.map(() => "linear-gradient(currentColor,currentColor)").join(",")};background-position:${selected.map(([position]) => position).join(",")};background-size:${selected.map(([, size]) => size).join(",")};background-repeat:no-repeat;`,
+    };
+  }
+}
+
+addBoxStyles(LIGHT_BOX_ARMS, "term-box");
+addBoxStyles(HEAVY_BOX_ARMS, "term-box term-box-heavy");
+for (const [codepoint, corner] of Object.entries(ROUNDED_BOX_CORNERS)) {
+  BOX_STYLES[Number(codepoint)] = {
+    className: `term-box term-box-round term-box-round-${corner}`,
+    style: "",
+  };
+}
+
+export class Renderer {
+  private container: HTMLElement;
+  private rows = 0;
+  private cols = 0;
+
+  private rowEls: HTMLDivElement[] = [];
+  private prevCursorRow = -1;
+  private prevCursorCol = -1;
+  private prevCursorVisible = false;
+  private rowIds: (number | null)[] = [];
+
+  private _scrollbackRowEls: HTMLDivElement[] = [];
+  private _scrollbackKeys: number[] = [];
+  private _scrollbackRowHeight = 0;
+  private _scrollbackGapSpacers: HTMLDivElement[] = [];
+  private _renderedScrollbackCount = -1;
+  private _renderedDiscardedCount = -1;
+  private _scrollbackTopSpacer: HTMLDivElement | null = null;
+  private _scrollbackBottomSpacer: HTMLDivElement | null = null;
+  private graphics: GraphicsLayer;
+  private searchLayer: HTMLDivElement;
+  private rowText = new WeakMap<HTMLElement, RenderedRowText>();
+  private rowParts = new WeakMap<HTMLElement, RowPart[]>();
+  private rowBackground = new WeakMap<HTMLElement, string>();
+  private selection: TrackedSelection | null = null;
+  private needsSetup = false;
+  private colorsChanged = false;
+  private painted = false;
+  private colorHost: HTMLElement;
+  private viewport: RenderViewport | undefined;
+  private gpu: GpuGrid | null = null;
+  private gpuWanted = false;
+  private gpuShown = false;
+  /** Every GPU row must be rebuilt: the DOM path painted frames the GPU missed. */
+  private gpuAllDirty = true;
+  /** Grid rows whose DOM text lags the GPU frame. */
+  private staleRows = new Set<number>();
+  private staleScrollback = false;
+  private forceText = false;
+  private searchActive = false;
+  private gpuPalette: GpuPalette | null = null;
+  private gpuCursor: GpuCursor | null = null;
+  private gpuCoreCursor: CursorState | null = null;
+  private hostObserver: MutationObserver | null = null;
+  private blinkTimer: ReturnType<typeof setInterval> | null = null;
+  private cellCanvas: HTMLCanvasElement;
+  private cellContext: CanvasRenderingContext2D | null = null;
+  private cellImage: ImageData | null = null;
+  private cellPixels: Uint32Array | null = null;
+  private cellEdges: Int32Array | null = null;
+  private cellTop: Uint32Array | null = null;
+  private cellBottom: Uint32Array | null = null;
+  private cellBandUsed: boolean[] = [];
+  private cellEnabled = false;
+  private cellSuspended = false;
+  private cellRowHeight = 0;
+  private cellCharWidth = 0;
+
+  get hasImageFlow(): boolean {
+    return (
+      this.container.parentElement?.classList.contains("has-image-flow") ??
+      false
+    );
+  }
+
+  constructor(
+    container: HTMLElement,
+    options: GraphicsLayerOptions & {
+      colorHost?: HTMLElement;
+      renderer?: "dom" | "webgl";
+    } = {},
+  ) {
+    this.container = container;
+    this.gpuWanted = options.renderer === "webgl";
+    this.colorHost = options.colorHost ?? container;
+    this.graphics = new GraphicsLayer(container, options);
+    this.searchLayer = document.createElement("div");
+    this.searchLayer.className = "term-search-layer";
+    this.searchLayer.setAttribute("aria-hidden", "true");
+    this.cellCanvas = document.createElement("canvas");
+    this.cellCanvas.className = "term-cell-canvas";
+    this.cellCanvas.setAttribute("aria-hidden", "true");
+    this.cellCanvas.addEventListener("contextrestored", () => {
+      if (this.cellImage) this.cellContext?.putImageData(this.cellImage, 0, 0);
+    });
+  }
+
+  setup(cols: number, rows: number): void {
+    this.cols = cols;
+    this.rows = rows;
+    this.container.innerHTML = "";
+    this.rowText = new WeakMap();
+    this.rowParts = new WeakMap();
+    this.rowBackground = new WeakMap();
+    this.rowEls = [];
+    this.rowIds = [];
+    this._scrollbackRowEls = [];
+    this._scrollbackKeys = [];
+    this._scrollbackGapSpacers = [];
+    this._renderedScrollbackCount = -1;
+    this._renderedDiscardedCount = -1;
+    this.cellEnabled = false;
+    this.cellRowHeight = 0;
+    this.cellCharWidth = 0;
+    this.releaseCellImage();
+
+    const fragment = document.createDocumentFragment();
+    this._scrollbackTopSpacer = document.createElement("div");
+    this._scrollbackTopSpacer.className = "term-scrollback-spacer";
+    fragment.appendChild(this._scrollbackTopSpacer);
+
+    this._scrollbackBottomSpacer = document.createElement("div");
+    this._scrollbackBottomSpacer.className = "term-scrollback-spacer";
+    fragment.appendChild(this._scrollbackBottomSpacer);
+
+    for (let r = 0; r < rows; r++) {
+      const rowEl = document.createElement("div");
+      rowEl.className = "term-row";
+      this.rowBackground.set(rowEl, "");
+      fragment.appendChild(rowEl);
+      this.rowEls.push(rowEl);
+    }
+    this.container.appendChild(fragment);
+    this.container.appendChild(this.cellCanvas);
+    this.searchLayer.replaceChildren();
+    this.container.appendChild(this.searchLayer);
+    if (this.gpu) this.container.appendChild(this.gpu.canvas);
+    this.gpuAllDirty = true;
+    this.staleRows.clear();
+    this.staleScrollback = false;
+    this.graphics.setup();
+    this.prevCursorRow = -1;
+    this.prevCursorCol = -1;
+  }
+
+  /**
+   * Sizes the live-row color canvas to the grid. Cell edges sit on whole CSS
+   * pixels, matching where the browser paints DOM cell backgrounds.
+   */
+  private syncCellCanvas(viewport?: RenderViewport): boolean {
+    const rowHeight = viewport?.rowHeight ?? 0;
+    const charWidth = viewport?.charWidth ?? 0;
+    const enabled =
+      Number.isInteger(rowHeight) &&
+      rowHeight > 0 &&
+      Number.isFinite(charWidth) &&
+      charWidth > 0 &&
+      !this.hasImageFlow &&
+      !this.cellSuspended &&
+      (this.cellContext ??= this.cellCanvas.getContext("2d")) !== null;
+    if (!enabled) {
+      const changed = this.cellEnabled;
+      this.cellEnabled = false;
+      if (changed) this.releaseCellImage();
+      return changed;
+    }
+    if (
+      this.cellEnabled &&
+      this.cellRowHeight === rowHeight &&
+      this.cellCharWidth === charWidth
+    )
+      return false;
+    const edges = new Int32Array(this.cols + 1);
+    for (let col = 0; col <= this.cols; col++)
+      edges[col] = Math.round(col * charWidth);
+    this.releaseCellImage();
+    this.cellEnabled = true;
+    this.cellRowHeight = rowHeight;
+    this.cellCharWidth = charWidth;
+    this.cellEdges = edges;
+    this.cellTop = new Uint32Array(this.cols);
+    this.cellBottom = new Uint32Array(this.cols);
+    return true;
+  }
+
+  /** Frees the canvas bitmap and pixel buffer until a row needs them again. */
+  private releaseCellImage(): void {
+    this.cellImage = null;
+    this.cellPixels = null;
+    this.cellBandUsed = [];
+    this.cellCanvas.width = 0;
+    this.cellCanvas.height = 0;
+    this.cellCanvas.hidden = true;
+  }
+
+  /** Allocates the canvas bitmap on the first row that has canvas cells. */
+  private ensureCellImage(): boolean {
+    if (this.cellImage) return true;
+    if (!this.cellContext) return false;
+    const width = Math.max(1, this.cellEdges![this.cols]);
+    const height = this.rows * this.cellRowHeight;
+    this.cellCanvas.width = width;
+    this.cellCanvas.height = height;
+    this.cellCanvas.style.width = `${width}px`;
+    this.cellCanvas.style.height = `${height}px`;
+    this.cellCanvas.hidden = false;
+    this.cellImage = this.cellContext.createImageData(width, height);
+    this.cellPixels = new Uint32Array(this.cellImage.data.buffer);
+    return true;
+  }
+
+  /** Expands one row's cell colors into its canvas band and uploads it. */
+  private paintCellBand(rowIndex: number, used: boolean): void {
+    if (!used && !this.cellBandUsed[rowIndex]) return;
+    if (!this.ensureCellImage()) return;
+    const pixels = this.cellPixels!;
+    const image = this.cellImage!;
+    const width = image.width;
+    const height = this.cellRowHeight;
+    const band = rowIndex * height * width;
+    if (!used) {
+      pixels.fill(0, band, band + height * width);
+    } else {
+      const edges = this.cellEdges!;
+      const top = this.cellTop!;
+      const bottom = this.cellBottom!;
+      const split = Math.round(height / 2);
+      const bottomLine = band + split * width;
+      for (let col = 0; col < this.cols; col++) {
+        pixels.fill(top[col], band + edges[col], band + edges[col + 1]);
+        pixels.fill(
+          bottom[col],
+          bottomLine + edges[col],
+          bottomLine + edges[col + 1],
+        );
+      }
+      for (let line = 1; line < height; line++) {
+        if (line === split) continue;
+        const source = line < split ? band : bottomLine;
+        pixels.copyWithin(band + line * width, source, source + width);
+      }
+    }
+    this.cellBandUsed[rowIndex] = used;
+    this.cellContext!.putImageData(
+      image,
+      0,
+      0,
+      0,
+      rowIndex * height,
+      width,
+      height,
+    );
+  }
+
+  private _buildRowContent(
+    rowEl: HTMLDivElement,
+    getCell: (col: number) => CellData,
+    lineLen: number,
+    cursorCol: number,
+    rowIndex: number,
+  ): void {
+    // Each part is one direct child: a cell span, text run, or complete link.
+    // Keeping their boundaries lets a redraw preserve unchanged Unicode cells.
+    const parts: RowPart[] = [];
+    let linkHtml = "";
+    const content: RenderedRowText = {
+      text: "",
+      specialCells: [],
+      metadata: null,
+    };
+    const recordText = (text: string, col: number, width = 1, omit = false) => {
+      const start = content.text.length;
+      content.text += text;
+      if (text.length !== width || width > 1 || omit) {
+        content.specialCells.push({
+          start,
+          end: content.text.length,
+          col,
+          width,
+          omit,
+        });
+      }
+    };
+    let runStyle = "";
+    let runText = "";
+    let runCells: string[] = [];
+    let runStart = 0;
+    let runLinkKey = "";
+    let runLinkUri: string | undefined;
+    let outputLinkKey = "";
+    let rowBackground: string | undefined;
+    let uniformBackground = lineLen >= this.cols;
+    const canvasTop = rowIndex >= 0 && this.cellEnabled ? this.cellTop : null;
+    const canvasBottom = this.cellBottom!;
+    if (canvasTop) {
+      canvasTop.fill(0);
+      canvasBottom.fill(0);
+    }
+    let canvasUsed = false;
+    let canvasText = "";
+    let canvasCols = 0;
+
+    const appendContent = (
+      content: RowPart,
+      linkKey: string,
+      uri: string | undefined,
+    ) => {
+      const href = safeLinkHref(uri);
+      const nextLinkKey = href ? linkKey : "";
+      if (nextLinkKey !== outputLinkKey) {
+        if (outputLinkKey) parts.push({ html: linkHtml + "</a>" });
+        if (nextLinkKey) {
+          linkHtml = `<a class="term-link" href="${escapeHTML(href!)}" target="_blank" rel="noopener noreferrer">`;
+        }
+        outputLinkKey = nextLinkKey;
+      }
+      if (outputLinkKey) linkHtml += content.html;
+      else parts.push(content);
+    };
+
+    const flushRun = (endCol: number) => {
+      if (!runText) return;
+      const append = (className: string, style: string, text: string) =>
+        appendContent(
+          cellSpanPart(className, style, text),
+          runLinkKey,
+          runLinkUri,
+        );
+
+      if (cursorCol >= runStart && cursorCol < endCol) {
+        const offset = cursorCol - runStart;
+        const before = runCells.slice(0, offset).join("");
+        const cursorChar = runCells[offset] || " ";
+        const after = runCells.slice(offset + 1).join("");
+
+        if (before) {
+          const style = columnStyle(offset) + runStyle;
+          append("", style, before);
+        }
+        const cursorStyle = cursorCellStyle(runStyle);
+        append("term-cursor", cursorStyle, cursorChar);
+        if (after) {
+          const style = columnStyle(runCells.length - offset - 1) + runStyle;
+          append("", style, after);
+        }
+      } else {
+        const style = columnStyle(runCells.length) + runStyle;
+        append("", style, runText);
+      }
+      runText = "";
+      runCells = [];
+    };
+
+    const appendStyledSpan = (
+      className: string,
+      style: string,
+      text: string,
+      linkKey: string,
+      linkUri?: string,
+    ) => {
+      appendContent(cellSpanPart(className, style, text), linkKey, linkUri);
+    };
+
+    const flushCanvasRun = () => {
+      if (!canvasCols) return;
+      appendStyledSpan(
+        "term-canvas-run",
+        columnStyle(canvasCols),
+        canvasText,
+        "",
+      );
+      canvasText = "";
+      canvasCols = 0;
+    };
+
+    for (let col = 0; col < this.cols; col++) {
+      const cell = getCell(col);
+      const inBounds = col < lineLen;
+      const cp = inBounds ? cell.char : 0;
+      const width = inBounds ? (cell.width ?? 1) : 1;
+      const cellLinkKey = inBounds ? linkIdentity(cell) : "";
+      const cellLinkUri = inBounds ? cell.linkUri : undefined;
+
+      if (
+        canvasTop &&
+        inBounds &&
+        width === 1 &&
+        col !== cursorCol &&
+        !cellLinkUri &&
+        !(
+          cell.flags &
+          (FLAG_DIM | FLAG_INVISIBLE | FLAG_UNDERLINE | FLAG_STRIKETHROUGH)
+        ) &&
+        (!cell.underlineStyle || cell.underlineStyle === "none") &&
+        (cp === 0x2580 || cp === 0x2584 || cp === 0x2588)
+      ) {
+        let foreground = cellColorPixel(cell.fg, cell.fgRgb);
+        let background = cellColorPixel(cell.bg, cell.bgRgb);
+        if (cell.flags & FLAG_REVERSE)
+          [foreground, background] = [background, foreground];
+        if (
+          foreground !== undefined &&
+          (cp === 0x2588 || background !== undefined)
+        ) {
+          flushRun(col);
+          canvasTop[col] = cp === 0x2584 ? background! : foreground;
+          canvasBottom[col] = cp === 0x2580 ? background! : foreground;
+          canvasUsed = true;
+          const text = cell.chars ?? String.fromCodePoint(cp);
+          recordText(text, col);
+          canvasText += text;
+          canvasCols++;
+          uniformBackground = false;
+          runStart = col + 1;
+          continue;
+        }
+      }
+      const canvasBackground =
+        canvasTop &&
+        inBounds &&
+        width === 1 &&
+        col !== cursorCol &&
+        !cellLinkKey &&
+        !(cell.flags & (FLAG_DIM | FLAG_INVISIBLE)) &&
+        !(cp >= 0x2580 && cp <= 0x259f)
+          ? cellBackgroundPixel(cell)
+          : undefined;
+      if (canvasTop && canvasBackground !== undefined) {
+        canvasTop[col] = canvasBackground;
+        canvasBottom[col] = canvasBackground;
+        canvasUsed = true;
+      }
+      flushCanvasRun();
+
+      // Only a shared, opaque background can fill the unused row width.
+      // Otherwise it would also show through default, dim, or hidden cells.
+      // A wide continuation is painted by its lead, not by its own style.
+      const continuesWide =
+        inBounds &&
+        width === 0 &&
+        col > 0 &&
+        (getCell(col - 1).width ?? 1) === 2;
+      if (uniformBackground && !continuesWide) {
+        const bg = resolveColors(
+          cell.fg,
+          cell.bg,
+          cell.flags,
+          cell.fgRgb,
+          cell.bgRgb,
+        ).bg;
+        if (
+          cell.flags & (FLAG_DIM | FLAG_INVISIBLE) ||
+          (rowBackground !== undefined && rowBackground !== bg)
+        ) {
+          uniformBackground = false;
+        } else {
+          rowBackground = bg;
+        }
+      }
+
+      if (inBounds && width === 0) {
+        flushRun(col);
+        // Skipping is only right when this continues the wide cell to the
+        // left, which already covers both columns and its cursor. A width-0
+        // cell with no wide cell before it owns its column, so dropping it
+        // would shorten the row.
+        if (!continuesWide) {
+          recordText(" ", col);
+          const style = buildCellStyle(cell);
+          const cursor = col === cursorCol;
+          appendStyledSpan(
+            cursor ? "term-cursor" : "",
+            cursor ? cursorCellStyle(style) : style,
+            " ",
+            cellLinkKey,
+            cellLinkUri,
+          );
+        }
+        runStyle = "";
+        runLinkKey = "";
+        runLinkUri = undefined;
+        runText = "";
+        runCells = [];
+        runStart = col + 1;
+        continue;
+      }
+
+      if (inBounds && width === 2) {
+        flushRun(col);
+
+        // A scrollback row keeps the width it was stored at, so a narrower
+        // grid can put the last rendered column on a wide lead whose
+        // continuation is outside the row. Drawing the pair here would spill
+        // a second column past the row.
+        if (col + 1 >= this.cols) {
+          recordText(" ", col);
+          const style = buildCellStyle(cell);
+          const cursor = col === cursorCol;
+          appendStyledSpan(
+            cursor ? "term-cursor" : "",
+            cursor ? cursorCellStyle(style) : style,
+            " ",
+            cellLinkKey,
+            cellLinkUri,
+          );
+          runStyle = "";
+          runLinkKey = "";
+          runLinkUri = undefined;
+          runText = "";
+          runCells = [];
+          runStart = col + 1;
+          continue;
+        }
+
+        const ch = cell.chars ?? (cp >= 32 ? String.fromCodePoint(cp) : " ");
+        recordText(ch, col, 2);
+        const style = buildCellStyle(cell);
+        const cursor = cursorCol >= col && cursorCol < col + 2;
+        const cls = cursor ? "term-wide term-cursor" : "term-wide";
+        appendStyledSpan(
+          cls,
+          cursor ? cursorCellStyle(style) : style,
+          ch,
+          cellLinkKey,
+          cellLinkUri,
+        );
+
+        runStyle = "";
+        runLinkKey = "";
+        runLinkUri = undefined;
+        runText = "";
+        runCells = [];
+        runStart = col + 2;
+        continue;
+      }
+
+      if (inBounds && cp >= 0x2580 && cp <= 0x259f) {
+        flushRun(col);
+        const ch = cell.chars ?? String.fromCodePoint(cp);
+        recordText(ch, col);
+
+        const colors = resolveColors(
+          cell.fg,
+          cell.bg,
+          cell.flags,
+          cell.fgRgb,
+          cell.bgRgb,
+        );
+        const cls = col === cursorCol ? "term-block term-cursor" : "term-block";
+        const bg = getBlockBackground(cp, colors.fg, colors.bg);
+        const style =
+          buildCellStyle(cell) + `color:${colors.fg};background:${bg};`;
+        appendStyledSpan(
+          cls,
+          col === cursorCol ? cursorCellStyle(style) : style,
+          ch,
+          cellLinkKey,
+          cellLinkUri,
+        );
+
+        runStyle = "";
+        runLinkKey = "";
+        runLinkUri = undefined;
+        runText = "";
+        runCells = [];
+        runStart = col + 1;
+      } else {
+        const ch =
+          cell.chars ?? (inBounds && cp >= 32 ? String.fromCodePoint(cp) : " ");
+        recordText(ch, col, 1, cell.spacerHead === true);
+        const style = inBounds
+          ? buildCellStyle(cell, canvasBackground === undefined)
+          : "";
+
+        // Font fallback can give a narrow Unicode glyph a different advance
+        // from ASCII. Bound each such cell (including complete graphemes) so
+        // it cannot move later cells within a text run.
+        if (ch.length !== 1 || ch.charCodeAt(0) > 0x7e) {
+          flushRun(col);
+          const cursor = col === cursorCol;
+          const box = BOX_STYLES[cp];
+          const boxStyle = box && ch === String.fromCodePoint(cp) ? box : null;
+          let className = boxStyle?.className ?? "";
+          if (boxStyle && cell.flags & FLAG_BOLD) className += " term-box-bold";
+          if (cursor) className += className ? " term-cursor" : "term-cursor";
+          appendStyledSpan(
+            className,
+            (cursor ? cursorCellStyle(style) : style) + (boxStyle?.style ?? ""),
+            ch,
+            cellLinkKey,
+            cellLinkUri,
+          );
+          runStyle = "";
+          runLinkKey = "";
+          runLinkUri = undefined;
+          runStart = col + 1;
+          continue;
+        }
+
+        if (style !== runStyle || cellLinkKey !== runLinkKey) {
+          flushRun(col);
+          runStyle = style;
+          runLinkKey = cellLinkKey;
+          runLinkUri = cellLinkUri;
+          runText = ch;
+          runCells = [ch];
+          runStart = col;
+        } else {
+          runText += ch;
+          runCells.push(ch);
+        }
+      }
+    }
+    flushRun(this.cols);
+    flushCanvasRun();
+    if (outputLinkKey) parts.push({ html: linkHtml + "</a>" });
+
+    this.updateRowParts(rowEl, parts);
+    this.rowText.set(rowEl, content);
+    if (canvasTop) this.paintCellBand(rowIndex, canvasUsed);
+
+    const bgCss =
+      uniformBackground && rowBackground !== DEFAULT_BG_CSS
+        ? (rowBackground ?? "")
+        : "";
+    if (this.rowBackground.get(rowEl) !== bgCss) {
+      rowEl.style.background = bgCss;
+      this.rowBackground.set(rowEl, bgCss);
+    }
+  }
+
+  private updateRowParts(row: HTMLElement, parts: RowPart[]): void {
+    const previous = this.rowParts.get(row);
+    let start = 0;
+    let oldEnd = previous?.length ?? 0;
+    let newEnd = parts.length;
+    if (previous) {
+      while (
+        start < oldEnd &&
+        start < newEnd &&
+        previous[start].html === parts[start].html
+      )
+        start++;
+      while (
+        oldEnd > start &&
+        newEnd > start &&
+        previous[oldEnd - 1].html === parts[newEnd - 1].html
+      ) {
+        oldEnd--;
+        newEnd--;
+      }
+    }
+    if (start === oldEnd && start === newEnd) return;
+
+    // Keep spans with unchanged geometry and styling. Assigning raw text to
+    // their existing text nodes avoids HTML parsing and element replacement.
+    let textOnly = previous !== undefined && oldEnd === newEnd;
+    for (let i = start; textOnly && i < newEnd; i++) {
+      const child = row.childNodes[i];
+      textOnly =
+        parts[i].opening !== undefined &&
+        parts[i].opening === previous![i].opening &&
+        child?.childNodes.length === 1 &&
+        child.firstChild?.nodeType === 3;
+    }
+    if (textOnly) {
+      for (let i = start; i < newEnd; i++) {
+        if (parts[i].html !== previous![i].html)
+          row.childNodes[i].firstChild!.nodeValue = parts[i].text!;
+      }
+      this.rowParts.set(row, parts);
+      return;
+    }
+
+    const retained = start + parts.length - newEnd;
+    const replaced = Math.max(oldEnd - start, newEnd - start);
+    // Parsing the whole row is cheaper when there is little to retain.
+    if (retained < replaced) {
+      row.innerHTML = parts.map((part) => part.html).join("");
+    } else {
+      // Replace only the changed middle, retaining the native text nodes and
+      // layout objects of the matching prefix and suffix. Links stay atomic.
+      const range = row.ownerDocument.createRange();
+      range.setStart(row, start);
+      range.setEnd(row, oldEnd);
+      range.deleteContents();
+      const html = parts
+        .slice(start, newEnd)
+        .map((part) => part.html)
+        .join("");
+      if (html) range.insertNode(range.createContextualFragment(html));
+    }
+    this.rowParts.set(row, parts);
+  }
+
+  private _updateScrollbackRow(
+    core: TerminalCore,
+    sbOffset: number,
+    rowEl: HTMLDivElement,
+  ): void {
+    const lineLen = core.getScrollbackLineLen(sbOffset);
+
+    this._buildRowContent(
+      rowEl,
+      (col) => core.getScrollbackCell(sbOffset, col),
+      lineLen,
+      -1,
+      -1,
+    );
+    const content = this.rowText.get(rowEl)!;
+    const metadata = core.getScrollbackRowMetadata?.(sbOffset);
+    content.metadata =
+      metadata && lineLen <= this.cols ? { ...metadata } : null;
+  }
+
+  private syncScrollback(core: TerminalCore, viewport?: RenderViewport): void {
+    const scrollbackCount = core.getScrollbackCount();
+    const rowHeight = viewport?.rowHeight ?? 0;
+    const virtual = viewport !== undefined && rowHeight > 0;
+    const overscan = viewport?.overscanRows ?? DEFAULT_SCROLLBACK_OVERSCAN_ROWS;
+    const hasDiscardedCount = viewport?.scrollbackDiscardedCount !== undefined;
+    const discardedCount = viewport?.scrollbackDiscardedCount ?? 0;
+    const viewportHeight =
+      viewport && viewport.clientHeight > 0
+        ? viewport.clientHeight
+        : this.rows * rowHeight;
+    const firstVisible = virtual
+      ? Math.floor(viewport.scrollTop / rowHeight)
+      : 0;
+    const visibleRows = virtual
+      ? Math.ceil(viewportHeight / rowHeight)
+      : scrollbackCount;
+    const start = virtual
+      ? Math.max(0, Math.min(scrollbackCount, firstVisible - overscan))
+      : 0;
+    const end = virtual
+      ? Math.max(
+          start,
+          Math.min(scrollbackCount, firstVisible + visibleRows + overscan),
+        )
+      : scrollbackCount;
+    const selection = selectionMayExist(this.container.ownerDocument)
+      ? this.container.ownerDocument.getSelection()
+      : null;
+    const selectionInContainer =
+      selection !== null &&
+      !selection.isCollapsed &&
+      (this.container.contains(selection.anchorNode) ||
+        this.container.contains(selection.focusNode));
+    // beforeMutation invalidates content even when history counts stay the same
+    // (for example OSC colors). Only scrolls through unchanged rows can reuse it.
+    const contentUnchanged =
+      this.painted &&
+      !this.colorsChanged &&
+      hasDiscardedCount &&
+      scrollbackCount === this._renderedScrollbackCount &&
+      discardedCount === this._renderedDiscardedCount;
+    // Keep the existing overscan window until the viewport approaches its edge.
+    const first = (this._scrollbackKeys[0] ?? Infinity) - discardedCount;
+    const last =
+      (this._scrollbackKeys[this._scrollbackKeys.length - 1] ?? -Infinity) -
+      discardedCount +
+      1;
+    const margin = Math.ceil(overscan / 2);
+    if (
+      virtual &&
+      contentUnchanged &&
+      !selectionInContainer &&
+      !viewport?.selectedRows &&
+      rowHeight === this._scrollbackRowHeight &&
+      this._scrollbackKeys.length === last - first &&
+      this._scrollbackKeys.length <= visibleRows + 2 * overscan &&
+      first <= Math.max(0, Math.min(scrollbackCount, firstVisible - margin)) &&
+      last >= Math.min(scrollbackCount, firstVisible + visibleRows + margin)
+    )
+      return;
+    const indices = new Set<number>();
+    for (let index = start; index < end; index++) indices.add(index);
+    if (
+      !viewport?.selectedRows &&
+      selectionInContainer &&
+      selection.rangeCount === 1
+    ) {
+      const range = selection.getRangeAt(0);
+      const selected = this._scrollbackRowEls.flatMap((row, i) =>
+        range.intersectsNode(row)
+          ? [this._scrollbackKeys[i] - discardedCount]
+          : [],
+      );
+      if (selected.length <= MAX_TRACKED_SELECTION_ROWS) {
+        for (const index of selected)
+          if (index >= 0 && index < scrollbackCount) indices.add(index);
+      }
+    }
+    if (viewport?.selectedRows) {
+      for (
+        let index = Math.max(0, viewport.selectedRows.start);
+        index <= Math.min(scrollbackCount - 1, viewport.selectedRows.end);
+        index++
+      )
+        indices.add(index);
+    }
+    const ordered = Array.from(indices).sort((a, b) => a - b);
+    const keys = ordered.map((index) => discardedCount + index);
+    if (
+      contentUnchanged &&
+      rowHeight === this._scrollbackRowHeight &&
+      keys.length === this._scrollbackKeys.length &&
+      keys.every((key, index) => key === this._scrollbackKeys[index])
+    ) {
+      return;
+    }
+
+    const previous = new Map<number, HTMLDivElement>();
+    for (let i = 0; i < this._scrollbackRowEls.length; i++) {
+      previous.set(this._scrollbackKeys[i], this._scrollbackRowEls[i]);
+    }
+
+    const retained = new Set(keys);
+    for (const [key, rowEl] of previous) {
+      if (!retained.has(key)) rowEl.remove();
+    }
+    for (const spacer of this._scrollbackGapSpacers) spacer.remove();
+    this._scrollbackGapSpacers = [];
+
+    const nextRows: HTMLDivElement[] = [];
+    let nextSibling = this._scrollbackTopSpacer?.nextSibling ?? null;
+    let previousIndex = (ordered[0] ?? scrollbackCount) - 1;
+    for (const index of ordered) {
+      if (index > previousIndex + 1) {
+        const spacer = document.createElement("div");
+        spacer.className = "term-scrollback-spacer";
+        spacer.style.height = `${(index - previousIndex - 1) * rowHeight}px`;
+        this.container.insertBefore(
+          spacer,
+          nextSibling ?? this._scrollbackBottomSpacer,
+        );
+        this._scrollbackGapSpacers.push(spacer);
+      }
+      previousIndex = index;
+      const key = discardedCount + index;
+      const offset = scrollbackCount - 1 - index;
+      let rowEl = previous.get(key);
+      if (!rowEl) {
+        rowEl = document.createElement("div");
+        rowEl.className = "term-row term-scrollback-row";
+        this._updateScrollbackRow(core, offset, rowEl);
+      } else if (!contentUnchanged) {
+        this._updateScrollbackRow(core, offset, rowEl);
+      }
+
+      if (rowEl !== nextSibling) {
+        this.container.insertBefore(
+          rowEl,
+          nextSibling ?? this._scrollbackBottomSpacer,
+        );
+      }
+      nextSibling = rowEl.nextSibling;
+      nextRows.push(rowEl);
+    }
+    this._scrollbackRowEls = nextRows;
+    this._scrollbackKeys = keys;
+    this._renderedScrollbackCount = scrollbackCount;
+    this._renderedDiscardedCount = discardedCount;
+    this._scrollbackRowHeight = rowHeight;
+
+    if (this._scrollbackTopSpacer) {
+      this._scrollbackTopSpacer.style.height = `${(ordered[0] ?? scrollbackCount) * rowHeight}px`;
+    }
+    if (this._scrollbackBottomSpacer) {
+      this._scrollbackBottomSpacer.style.height = `${ordered.length ? (scrollbackCount - ordered[ordered.length - 1] - 1) * rowHeight : 0}px`;
+    }
+  }
+
+  /** Applies application color overrides; true when any changed. */
+  private syncColorOverrides(colors: TerminalColorOverrides = {}): boolean {
+    let changed = false;
+    for (const [key, property] of [
+      ["foreground", "--term-app-fg"],
+      ["background", "--term-app-bg"],
+      ["cursor", "--term-app-cursor"],
+    ] as const) {
+      const value = colors[key];
+      const css = value === undefined ? "" : rgbToCSS(value);
+      if (this.colorHost.style.getPropertyValue(property) === css) continue;
+      changed = true;
+      if (css) this.colorHost.style.setProperty(property, css);
+      else this.colorHost.style.removeProperty(property);
+    }
+    return changed;
+  }
+
+  /** Reuses live row nodes and canvas bands by the core's content identity. */
+  private syncLiveRows(core: TerminalCore): Set<number> | null {
+    const ids = core.getRowId
+      ? Array.from({ length: this.rows }, (_, row) => core.getRowId!(row))
+      : [];
+    const previous = this.rowIds;
+    this.rowIds = ids.includes(null) ? [] : ids;
+    if (!this.rowIds.length) return null;
+    if (previous.length !== ids.length)
+      return new Set(ids.map((_, row) => row));
+    if (ids.every((id, row) => id === previous[row])) return null;
+
+    const oldRows = new Map<number | null, number>();
+    for (let row = 0; row < previous.length; row++)
+      oldRows.set(previous[row], row);
+    const sources = ids.map((id) => oldRows.get(id) ?? -1);
+    const retained = new Set(sources);
+    const available = this.rowEls
+      .map((_, row) => row)
+      .filter((row) => !retained.has(row))
+      .reverse();
+    const fresh = new Set<number>();
+    for (let row = 0; row < this.rows; row++) {
+      if (sources[row] < 0) {
+        sources[row] = available.pop()!;
+        fresh.add(row);
+      }
+    }
+    this.rowEls = sources.map((source) => this.rowEls[source]);
+    this.prevCursorRow = sources.indexOf(this.prevCursorRow);
+
+    const firstMoved = sources.findIndex(
+      (source, row) => !fresh.has(row) && source !== row,
+    );
+    if (firstMoved >= 0 && sources[firstMoved] > firstMoved) {
+      let next: Node = this.cellCanvas;
+      for (let row = this.rows - 1; row >= 0; row--) {
+        const element = this.rowEls[row];
+        if (element.nextSibling !== next)
+          this.container.insertBefore(element, next);
+        next = element;
+      }
+    } else {
+      let next = this._scrollbackBottomSpacer!.nextSibling;
+      for (const element of this.rowEls) {
+        if (element !== next) this.container.insertBefore(element, next);
+        next = element.nextSibling;
+      }
+    }
+
+    if (this.cellPixels && this.cellBandUsed.some(Boolean)) {
+      const pixels = this.cellPixels.slice();
+      const bandSize = this.cellImage!.width * this.cellRowHeight;
+      for (let row = 0; row < this.rows; row++) {
+        const start = sources[row] * bandSize;
+        this.cellPixels.set(
+          pixels.subarray(start, start + bandSize),
+          row * bandSize,
+        );
+      }
+      this.cellContext!.putImageData(this.cellImage!, 0, 0);
+    }
+    this.cellBandUsed = sources.map((source) => this.cellBandUsed[source]);
+    return fresh;
+  }
+
+  render(core: TerminalCore, viewport?: RenderViewport): void {
+    if (this.syncColorOverrides(core.getColorOverrides?.()))
+      this.gpuPalette = null;
+    this.viewport = viewport;
+    this.selection ??= new TrackedSelection(
+      this.container.parentElement ?? this.container,
+    );
+    const positions = this.selection.beforeRender(core, this.selectionRows());
+    const rows = core.getRows();
+    const cols = core.getCols();
+
+    let resized = false;
+    if (this.needsSetup || rows !== this.rows || cols !== this.cols) {
+      this.setup(cols, rows);
+      this.needsSetup = false;
+      resized = true;
+    }
+
+    const gpuEligible = this._gpuEligible(core, viewport, positions !== null);
+    if (
+      gpuEligible &&
+      !this.forceText &&
+      this._gpuFrame(core, viewport!, resized)
+    )
+      return;
+    // A text-only render leaves the matching GPU frame on screen; any other
+    // DOM frame, including one the GPU path declined, shows the DOM text.
+    if (!gpuEligible || !this.forceText) this._hideGpu();
+
+    this.syncScrollback(
+      core,
+      viewport && {
+        ...viewport,
+        selectedRows: positions
+          ? { start: positions.start.row, end: positions.end.row }
+          : undefined,
+      },
+    );
+
+    this.graphics.reconcile(core, {
+      scrollTop: viewport?.scrollTop ?? 0,
+      clientHeight: viewport?.clientHeight ?? 0,
+      rowHeight: viewport?.rowHeight ?? 0,
+      charWidth: viewport?.charWidth ?? 0,
+      overscanRows: viewport?.overscanRows ?? DEFAULT_SCROLLBACK_OVERSCAN_ROWS,
+      scrollbackCount: core.getScrollbackCount(),
+    });
+    const canvasChanged = this.syncCellCanvas(viewport);
+    const freshRows = this.syncLiveRows(core);
+    this.cellCanvas.style.top = `${core.getScrollbackCount() * (viewport?.rowHeight ?? 0)}px`;
+
+    const cursor = core.getCursor();
+    const cursorVisible = cursor.visible;
+    const shape = cursor.shape ?? "block";
+    const blink = String(cursor.blinking ?? false);
+    // Shape and blink changes need no cell replacement: CSS reads the grid state.
+    if (this.container.dataset.cursorShape !== shape)
+      this.container.dataset.cursorShape = shape;
+    if (this.container.dataset.cursorBlink !== blink)
+      this.container.dataset.cursorBlink = blink;
+
+    const needsCursorUpdate =
+      cursor.row !== this.prevCursorRow ||
+      cursor.col !== this.prevCursorCol ||
+      cursorVisible !== this.prevCursorVisible;
+
+    for (let r = 0; r < this.rows; r++) {
+      const isDirty =
+        this.colorsChanged ||
+        resized ||
+        canvasChanged ||
+        freshRows?.has(r) ||
+        this.staleRows.has(r) ||
+        (this.rowIds.length
+          ? (core.isRowContentDirty?.(r) ?? core.isDirtyRow(r))
+          : core.isDirtyRow(r));
+      const hadCursor = r === this.prevCursorRow && needsCursorUpdate;
+      const hasCursor = r === cursor.row;
+
+      if (isDirty || hadCursor || (hasCursor && needsCursorUpdate)) {
+        const cCol = hasCursor && cursorVisible ? cursor.col : -1;
+        this._buildRowContent(
+          this.rowEls[r],
+          (col) => core.getCell(r, col),
+          this.cols,
+          cCol,
+          r,
+        );
+      }
+      const content = this.rowText.get(this.rowEls[r]);
+      if (content) {
+        const metadata = core.getRowMetadata?.(r);
+        content.metadata = metadata ? { ...metadata } : null;
+      }
+    }
+
+    this.prevCursorRow = cursor.row;
+    this.prevCursorCol = cursor.col;
+    this.prevCursorVisible = cursorVisible;
+
+    core.clearDirty();
+    this.staleRows.clear();
+    this.staleScrollback = false;
+    this.forceText = false;
+    // Newly mounted history moves the live rows; keep the canvas over them.
+    if (this.gpuShown) this._placeGpuCanvas();
+    this.gpuAllDirty = true;
+    this.colorsChanged = false;
+    this.selection.afterRender(this.selectionRows(), positions);
+    this.painted = true;
+  }
+
+  /** Mounted rows in chronological, retained-buffer coordinates. */
+  *searchRows(): Generator<{ row: number; element: HTMLDivElement }> {
+    for (let i = 0; i < this._scrollbackRowEls.length; i++) {
+      yield {
+        row:
+          this._scrollbackKeys[i] - Math.max(0, this._renderedDiscardedCount),
+        element: this._scrollbackRowEls[i],
+      };
+    }
+    for (let i = 0; i < this.rowEls.length; i++) {
+      yield {
+        row: Math.max(0, this._renderedScrollbackCount) + i,
+        element: this.rowEls[i],
+      };
+    }
+  }
+
+  /** Plain text for the native selection, or null when this terminal does not own it. */
+  getSelectionText(): string | null {
+    const terminal = this.container.parentElement;
+    if (!terminal) return null;
+    return getSelectionText(terminal, this.selectionRows());
+  }
+
+  private *selectionRows() {
+    for (const row of this.searchRows()) {
+      const content = this.rowText.get(row.element);
+      if (content) yield { ...row, content };
+    }
+  }
+
+  beforeMutation(core: TerminalCore): void {
+    this.selection?.beforeMutation(core, this.selectionRows());
+    this.painted = false;
+  }
+
+  /** Resolve a mounted row hit using cell geometry, including wide glyphs. */
+  positionAt(
+    target: Element,
+    clientX: number,
+    charWidth: number,
+  ): TerminalPosition | null {
+    if (!this.painted || this.needsSetup || charWidth <= 0) return null;
+    const element = target.closest(".term-row");
+    const mounted = Array.from(this.searchRows()).find(
+      (row) => row.element === element,
+    );
+    if (!mounted) return null;
+    const col = Math.floor(
+      (clientX - mounted.element.getBoundingClientRect().left) / charWidth,
+    );
+    return col >= 0 && col < this.cols ? { row: mounted.row, col } : null;
+  }
+
+  select(
+    core: TerminalCore,
+    position: TerminalPosition,
+    unit: SelectionUnit,
+    beforeSelect: () => void,
+  ): boolean {
+    if (!this.painted || this.needsSetup) return false;
+    const range = selectionRange(core, position, unit);
+    if (!range) return false;
+    beforeSelect();
+    // Blurring the terminal input may synchronously deliver a focus report.
+    // A host can write, resize or destroy in that callback.
+    if (!this.painted || this.needsSetup) return false;
+    this.syncScrollback(core, {
+      ...(this.viewport ?? { scrollTop: 0, clientHeight: 0, rowHeight: 0 }),
+      selectedRows: { start: range.start.row, end: range.end.row },
+    });
+    const mounted = Array.from(this.selectionRows());
+    const edge = (position: TerminalPosition, after: boolean) => {
+      const row = mounted.find((row) => row.row === position.row);
+      return (
+        row &&
+        textPoint(row.element, offsetAtCell(row.content, position.col, after))
+      );
+    };
+    const start = edge(range.start, false),
+      end = edge(range.end, true);
+    const native = this.container.ownerDocument.getSelection();
+    if (!start || !end || !native) return false;
+    markSelectionChanged(this.container.ownerDocument);
+    native.setBaseAndExtent(...start, ...end);
+    this.selection?.capture(core, this.selectionRows());
+    return true;
+  }
+
+  rectangle(
+    core: TerminalCore,
+    start: TerminalPosition,
+    end: TerminalPosition,
+    beforeSelect: () => void,
+  ) {
+    if (!this.painted || this.needsSetup) return null;
+    const rectangle = rectangleSelection(core, start, end);
+    if (!rectangle) return null;
+    beforeSelect();
+    return this.painted && !this.needsSetup ? rectangle : null;
+  }
+
+  /** Clamp a drag to the nearest mounted row without mounting extra history. */
+  dragPositionAt(
+    clientX: number,
+    clientY: number,
+    charWidth: number,
+  ): TerminalPosition | null {
+    if (!this.painted || this.needsSetup || charWidth <= 0) return null;
+    let nearest: { row: number; col: number; distance: number } | null = null;
+    for (const { row, element } of this.searchRows()) {
+      const rect = element.getBoundingClientRect();
+      const distance = Math.max(rect.top - clientY, clientY - rect.bottom, 0);
+      if (!nearest || distance < nearest.distance)
+        nearest = {
+          row,
+          distance,
+          col: Math.max(
+            0,
+            Math.min(
+              this.cols - 1,
+              Math.floor((clientX - rect.left) / charWidth),
+            ),
+          ),
+        };
+    }
+    return nearest && { row: nearest.row, col: nearest.col };
+  }
+
+  /** Turns the color canvas off so block cells keep their own colored spans. */
+  setCanvasSuspended(suspended: boolean): void {
+    this.cellSuspended = suspended;
+  }
+
+  requestSetup(): void {
+    this.needsSetup = true;
+  }
+
+  /** Re-read indexed colors in live and retained rows without rebuilding the grid. */
+  invalidateColors(): void {
+    this.colorsChanged = true;
+  }
+
+  /** Replaces decorations only, preserving native text selection. */
+  setSearchDecorations(decorations: DocumentFragment): void {
+    this.searchActive = decorations.firstChild !== null;
+    if (!decorations.firstChild && !this.searchLayer.firstChild) return;
+    this.searchLayer.replaceChildren(decorations);
+  }
+
+  /** DOM text lags the painted GPU frame; a text render brings it current. */
+  get textStale(): boolean {
+    return this.staleRows.size > 0 || this.staleScrollback;
+  }
+
+  /** The next render rebuilds DOM text even when the GPU path could paint. */
+  requestText(): void {
+    this.forceText = true;
+  }
+
+  /** Shows the DOM text until the GPU path is eligible again, e.g. for selection. */
+  yieldToDom(): void {
+    this._hideGpu();
+    this.gpuAllDirty = true;
+  }
+
+  /** The GPU path can show this frame: live output with nothing that needs DOM. */
+  private _gpuEligible(
+    core: TerminalCore,
+    viewport: RenderViewport | undefined,
+    selecting: boolean,
+  ): boolean {
+    return (
+      this.gpuWanted &&
+      !selecting &&
+      !this.searchActive &&
+      viewport?.live === true &&
+      !!viewport.charWidth &&
+      !!viewport.rowHeight &&
+      GpuGrid.fits(
+        this.cols,
+        this.rows,
+        viewport.charWidth,
+        viewport.rowHeight,
+      ) &&
+      !this.hasImageFlow &&
+      // Image positions follow the DOM scrollback, which the GPU path defers.
+      ((core.getGraphicsState?.()?.placements.length ?? 0) === 0 ||
+        core.getScrollbackCount() === this._renderedScrollbackCount)
+    );
+  }
+
+  private _gpuFrame(
+    core: TerminalCore,
+    viewport: RenderViewport,
+    resized: boolean,
+  ): boolean {
+    if (!this.gpu) {
+      this.gpu = GpuGrid.create();
+      if (!this.gpu) {
+        this.gpuWanted = false;
+        return false;
+      }
+      // Hidden until a GPU frame paints it; a declined first frame keeps DOM.
+      this.gpu.canvas.hidden = true;
+      this.container.appendChild(this.gpu.canvas);
+      this._observeHost();
+    }
+    if (this.gpu.contextLost) {
+      this.gpu.destroy();
+      this.gpu = null;
+      this.gpuWanted = false;
+      return false;
+    }
+    if (this.colorsChanged || !this.gpuPalette)
+      this.gpuPalette = this._readPalette();
+    const style = getComputedStyle(this.container);
+    const reconfigured = this.gpu.configure(
+      this.cols,
+      this.rows,
+      {
+        charWidth: viewport.charWidth ?? 0,
+        rowHeight: viewport.rowHeight,
+        fontFamily: style.fontFamily,
+        fontSize: parseFloat(style.fontSize),
+      },
+      this.gpuPalette,
+    );
+    const all =
+      this.gpuAllDirty || reconfigured || resized || this.colorsChanged;
+    for (let r = 0; r < this.rows; r++) {
+      if (all || core.isDirtyRow(r)) {
+        this.gpu.updateRow(core, r);
+        this.staleRows.add(r);
+      }
+    }
+    // Filling the atlas clears it, leaving rows built earlier this frame
+    // pointing at freed slots: rebuild every row against the fresh atlas.
+    if (this.gpu.atlasStale) {
+      this.gpu.acknowledgeAtlas();
+      for (let r = 0; r < this.rows; r++) this.gpu.updateRow(core, r);
+      // More distinct glyphs on screen than the atlas holds: paint this
+      // frame as DOM text and rebuild the GPU rows on the next one.
+      if (this.gpu.atlasStale) {
+        this.gpu.acknowledgeAtlas();
+        this.staleRows.clear();
+        this.gpuAllDirty = true;
+        return false;
+      }
+    }
+    if (core.getScrollbackCount() !== this._renderedScrollbackCount)
+      this.staleScrollback = true;
+    const cursor = core.getCursor();
+    this.gpuCoreCursor = cursor;
+    this._applyGpuCursor();
+    core.clearDirty();
+    this.gpuAllDirty = false;
+    this.colorsChanged = false;
+    this.prevCursorRow = -1;
+    this.gpu.draw();
+    this.graphics.reconcile(core, {
+      scrollTop: viewport.scrollTop,
+      clientHeight: viewport.clientHeight,
+      rowHeight: viewport.rowHeight,
+      charWidth: viewport.charWidth ?? 0,
+      overscanRows: viewport.overscanRows ?? DEFAULT_SCROLLBACK_OVERSCAN_ROWS,
+      scrollbackCount: core.getScrollbackCount(),
+    });
+    this._placeGpuCanvas();
+
+    if (!this.gpuShown) {
+      this.gpu.canvas.hidden = false;
+      this.container.classList.add("term-gpu-active");
+      this.gpuShown = true;
+    }
+    this.painted = true;
+    return true;
+  }
+
+  /** Cursor focus and blink from the host, as the CSS reads them. */
+  private _applyGpuCursor(): void {
+    const cursor = this.gpuCoreCursor;
+    if (!this.gpu || !cursor) return;
+    const host = this.container.parentElement;
+    // Mirrors the CSS: solid and blinking only while the terminal has focus.
+    const focused = host?.matches(".focused, :active") ?? false;
+    const blinking =
+      focused &&
+      ((host?.classList.contains("cursor-blink") ?? false) ||
+        (!(host?.classList.contains("cursor-steady") ?? false) &&
+          cursor.blinking === true));
+    this.gpuCursor = {
+      row: cursor.row,
+      col: cursor.col,
+      shape: cursor.shape ?? "block",
+      visible: cursor.visible,
+      focused,
+    };
+    this._syncBlink(blinking);
+    this.gpu.setCursor(this._blinkedCursor(blinking));
+  }
+
+  /** Focus and blink classes change without output; redraw the cursor then. */
+  private _observeHost(): void {
+    const host = this.container.parentElement;
+    if (!host || this.hostObserver) return;
+    this.hostObserver = new MutationObserver(() => {
+      if (!this.gpu || !this.gpuShown) return;
+      this._applyGpuCursor();
+      this.gpu.draw();
+    });
+    this.hostObserver.observe(host, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+  }
+
+  /** The cursor with the CSS blink phase applied: on for the first half second. */
+  private _blinkedCursor(blinking: boolean): GpuCursor | null {
+    const c = this.gpuCursor;
+    if (!c || !blinking) return c;
+    return { ...c, visible: c.visible && performance.now() % 1000 < 500 };
+  }
+
+  private _syncBlink(blinking: boolean): void {
+    if (!blinking) {
+      if (this.blinkTimer !== null) clearInterval(this.blinkTimer);
+      this.blinkTimer = null;
+      return;
+    }
+    this.blinkTimer ??= setInterval(() => {
+      if (!this.gpu || !this.gpuShown) return;
+      this.gpu.setCursor(this._blinkedCursor(true));
+      this.gpu.draw();
+    }, 500);
+  }
+
+  private _placeGpuCanvas(): void {
+    const first = this.rowEls[0];
+    if (!first || !this.gpu) return;
+    const transform = `translate(${first.offsetLeft}px, ${first.offsetTop}px)`;
+    if (this.gpu.canvas.style.transform !== transform)
+      this.gpu.canvas.style.transform = transform;
+  }
+
+  private _hideGpu(): void {
+    this._syncBlink(false);
+    if (!this.gpuShown || !this.gpu) return;
+    this.gpu.canvas.hidden = true;
+    this.container.classList.remove("term-gpu-active");
+    this.gpuShown = false;
+  }
+
+  /** Resolves the theme's CSS colors to RGB for the GPU path. */
+  private _readPalette(): GpuPalette {
+    const probe = document.createElement("span");
+    probe.style.display = "none";
+    this.colorHost.appendChild(probe);
+    const read = (name: string, fallback: string) => {
+      probe.style.color = `var(${name}, ${fallback})`;
+      const m = getComputedStyle(probe).color.match(/\d+(\.\d+)?/g);
+      return m ? (Number(m[0]) << 16) | (Number(m[1]) << 8) | Number(m[2]) : 0;
+    };
+    const palette = {
+      // Application overrides win over the theme, as in the CSS.
+      fg: read("--term-app-fg", "var(--term-fg, #e5e5e5)"),
+      bg: read("--term-app-bg", "var(--term-bg, #000)"),
+      cursor: read(
+        "--term-app-cursor",
+        "var(--term-cursor, var(--term-app-fg, var(--term-fg, #e5e5e5)))",
+      ),
+      ansi: Array.from({ length: 16 }, (_, i) =>
+        read(`--term-color-${i}`, "#000"),
+      ),
+    };
+    probe.remove();
+    return palette;
+  }
+
+  destroy(): void {
+    this.hostObserver?.disconnect();
+    this.hostObserver = null;
+    this._syncBlink(false);
+    this.gpu?.destroy();
+    this.gpu = null;
+    this.syncColorOverrides();
+    this.painted = false;
+    this.selection?.dispose();
+    this.graphics.destroy();
+    this.container.innerHTML = "";
+    this.rowEls = [];
+    this._scrollbackRowEls = [];
+    this.cellImage = null;
+    this.cellPixels = null;
+    this.cellContext = null;
+  }
+}

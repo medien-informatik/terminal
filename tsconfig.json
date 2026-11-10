@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": false,
+    "types": [
+      "vite/client"
+    ],
+    "paths": {
+      "@wterm/core": [
+        "./packages/core/src/index.ts"
+      ],
+      "@wterm/dom": [
+        "./packages/dom/src/index.ts"
+      ],
+      "@wterm/just-bash": [
+        "./packages/just-bash/src/index.ts"
+      ],
+      "@wterm/python": [
+        "./packages/python/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "packages/*/src"
+  ]
+}
