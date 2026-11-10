@@ -27,6 +27,9 @@
       ],
       "@wterm/python": [
         "./packages/python/src/index.ts"
+      ],
+      "@wterm/psql": [
+        "./packages/psql/src/index.ts"
       ]
     }
   },

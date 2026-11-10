@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>wterm lokal – psql</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { height: 100%; background: #1a1a2e; }
+      #terminal { height: 100%; }
+    </style>
+
+    <!--
+      SQL-Skripte, die vor dem Start von psql in der Datenbank ausgeführt werden
+      (in Dokumentreihenfolge). Möglich sind Inline-SQL oder src="datei.sql".
+      data-name legt den Namen für Fehlermeldungen und für \i fest.
+    -->
+    <script type="text/sql" data-name="schema.sql">
+      CREATE TABLE kunden (
+        id         serial PRIMARY KEY,
+        name       text NOT NULL,
+        stadt      text,
+        angelegt   date NOT NULL DEFAULT current_date
+      );
+
+      CREATE TABLE bestellungen (
+        id         serial PRIMARY KEY,
+        kunde_id   integer NOT NULL REFERENCES kunden (id),
+        artikel    text NOT NULL,
+        menge      integer NOT NULL CHECK (menge > 0),
+        preis      numeric(10, 2) NOT NULL
+      );
+
+      CREATE INDEX bestellungen_kunde_idx ON bestellungen (kunde_id);
+    </script>
+    <script type="text/sql" data-name="daten.sql">
+      INSERT INTO kunden (name, stadt) VALUES
+        ('Ada Lovelace', 'London'),
+        ('Konrad Zuse', 'Berlin'),
+        ('Grace Hopper', 'New York');
+
+      INSERT INTO bestellungen (kunde_id, artikel, menge, preis) VALUES
+        (1, 'Rechenschieber', 2, 19.90),
+        (2, 'Relais', 120, 0.45),
+        (2, 'Lochstreifen', 10, 3.20),
+        (3, 'Compiler-Handbuch', 1, 49.00);
+
+      CREATE VIEW umsatz_pro_kunde AS
+        SELECT k.name, sum(b.menge * b.preis) AS umsatz
+        FROM kunden k JOIN bestellungen b ON b.kunde_id = k.id
+        GROUP BY k.name;
+    </script>
+  </head>
+  <body>
+    <div id="terminal"></div>
+    <script type="module" src="/src/psql-main.ts"></script>
+  </body>
+</html>

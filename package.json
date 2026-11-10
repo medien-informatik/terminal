@@ -16,6 +16,7 @@
     "prepare-assets": "node scripts/inline-wasm.mjs && node scripts/copy-pyodide.mjs"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.16",
     "diff": "^9.0.0",
     "isomorphic-git": "^1.44.12",
     "just-bash": "^3.4.2",

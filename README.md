@@ -21,6 +21,8 @@ siehe `LICENSE`) als eigenständiges Vite-Projekt. Alles läuft **lokal im Brows
 | `packages/python/` | **neu:** `@wterm/python` – `python`/`python3`/`pip` auf Basis von Pyodide |
 | `index.html`, `src/main.ts` | Seite `/`: Terminal mit Shell, nano und git |
 | `python.html`, `src/python-main.ts` | Seite `/python.html`: zusätzlich mit Python |
+| `packages/psql/` | **neu:** `@wterm/psql` – psql-Simulation auf Basis von PGlite |
+| `psql.html`, `src/psql-main.ts` | Seite `/psql.html`: psql direkt (ohne Shell) |
 | `scripts/inline-wasm.mjs` | bettet die WASM-Datei als Base64 ein (läuft automatisch vor `dev`/`build`) |
 | `scripts/copy-pyodide.mjs` | kopiert die Pyodide-Laufzeit nach `public/pyodide/` (automatisch vor `dev`/`build`) |
 
@@ -32,8 +34,8 @@ mit Server (SSH/lokale PTY) und die Tests.
 
 ```bash
 npm install
-npm run dev        # http://127.0.0.1:5173 und http://127.0.0.1:5173/python.html
-npm run build      # statischer Build nach dist/ (beide Seiten)
+npm run dev        # http://127.0.0.1:5173, …/python.html und …/psql.html
+npm run build      # statischer Build nach dist/ (alle Seiten)
 ```
 
 ## nano
@@ -120,6 +122,46 @@ lädt Pyodide nicht und verhält sich unverändert.
 - Python läuft im Haupt-Thread: Endlosschleifen lassen sich nicht mit Strg+C abbrechen, dann hilft
   nur das Neuladen der Seite.
 
+## psql (`/psql.html`)
+
+Die Seite startet direkt **psql** – ohne Bash. Die Datenbank ist PostgreSQL über
+[PGlite](https://pglite.dev/) (WebAssembly, im Arbeitsspeicher, ~15 MB, lokal ausgeliefert).
+
+### SQL-Skripte in der Seite
+
+Alle `<script type="text/sql">` werden in Dokumentreihenfolge ausgeführt, bevor psql startet:
+
+```html
+<script type="text/sql" data-name="schema.sql">
+  CREATE TABLE kunden (id serial PRIMARY KEY, name text NOT NULL);
+</script>
+<script type="text/sql" src="daten.sql"></script>
+```
+
+- Inline-SQL oder `src="…"` (relativ zur Seite, wird per `fetch` geladen – Dateien dafür in
+  `public/` ablegen, damit sie im Build landen).
+- `data-name` bestimmt den Namen in Fehlermeldungen (`psql:schema.sql:3: ERROR: …`) und für `\i`.
+- Ergebnisse werden nicht angezeigt, Fehler und NOTICEs schon. Die Ausführung läuft bei Fehlern
+  weiter (wie `psql -f`).
+- Die Skripte stehen danach als Dateien bereit, z. B. `\i schema.sql`.
+
+### Was psql kann
+
+- Prompt wie im Original: `postgres=#`, Fortsetzung `postgres-#`, offene Strings/Klammern
+  (`'#`, `(#`), Transaktionen `postgres=*#` und fehlgeschlagene Transaktion `postgres=!#`.
+- Statements enden mit `;` (Strings, `"Bezeichner"`, `$$…$$`, Kommentare werden beachtet);
+  mehrzeilige Eingabe, Verlauf mit ↑/↓, Strg+C verwirft den Puffer.
+- Ausgabe wie psql: ausgerichtete Tabellen (Zahlen rechtsbündig, mehrzeilige Werte mit `+`),
+  `(n rows)`, Command-Tags (`INSERT 0 1`, `UPDATE 2`, …), `NOTICE`, Fehler mit `LINE n:` und `^`,
+  `DETAIL`/`HINT`/`CONTEXT`.
+- Meta-Befehle: `\q`, `\?`, `\h`, `\d`, `\d NAME`, `\dt`, `\dv`, `\di`, `\ds`, `\dn`, `\df`, `\du`,
+  `\dx`, `\l`, `\x [on|off|auto]`, `\a`, `\t`, `\pset`, `\timing`, `\i`, `\w`, `\g`, `\gx`, `\p`, `\r`,
+  `\s`, `\echo`, `\set ON_ERROR_STOP`, `\c`, `\conninfo`, `\encoding`; außerdem `help`, `quit`, `exit`.
+- `\q` beendet die Sitzung; Enter startet eine neue (die Datenbank bleibt bis zum Neuladen erhalten).
+
+Nicht unterstützt: andere Datenbanken als `postgres` (`\c`), `\e`, `\!` (keine Shell), `\copy`,
+Variablen-Ersetzung (`:name`), Tab-Vervollständigung. Lange Abfragen lassen sich nicht abbrechen.
+
 ## Umgebungsvariablen
 
 Die Shell merkt sich Variablen über Befehlszeilen hinweg, wie eine echte Bash:
@@ -139,9 +181,9 @@ dabei unverändert.
 
 ## Veröffentlichen auf GitHub Pages
 
-Der Build ist rein statisch (`dist/`, ca. 15 MB inkl. Pyodide) und nutzt relative Pfade
+Der Build ist rein statisch (`dist/`, ca. 31 MB inkl. Pyodide und PGlite) und nutzt relative Pfade
 (`base: "./"` in `vite.config.ts`). Er funktioniert daher unter jedem Unterpfad, z. B.
-`https://medien-informatik.github.io/terminal/` und `…/terminal/python.html`.
+`https://medien-informatik.github.io/terminal/`, `…/terminal/python.html` und `…/terminal/psql.html`.
 
 Der Workflow [`.github/workflows/pages.yml`](.github/workflows/pages.yml) baut bei jedem Push auf
 `main` (oder manuell über „Run workflow“) mit Node 24 und veröffentlicht `dist/`.
