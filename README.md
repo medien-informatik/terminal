@@ -1,8 +1,8 @@
-# wterm lokal – Terminal-Simulation im Browser mit nano
+# wterm lokal – Terminal-Simulation im Browser
 
 ## TL;DR
 
- - Live: [mingo](https://medien-informatik.github.io/terminal/python.html)
+ - Live: [Python](https://medien-informatik.github.io/terminal/python.html)
 
 ## Project
 
