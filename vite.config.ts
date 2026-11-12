@@ -36,6 +36,7 @@ export default defineConfig({
       { find: /^@wterm\/just-bash$/, replacement: pkg("just-bash/src/index.ts") },
       { find: /^@wterm\/python$/, replacement: pkg("python/src/index.ts") },
       { find: /^@wterm\/psql$/, replacement: pkg("psql/src/index.ts") },
+      { find: /^@wterm\/mongosh$/, replacement: pkg("mongosh/src/index.ts") },
     ],
   },
   // Pyodide lädt seine Laufzeitdateien selbst (aus public/pyodide/).
@@ -50,6 +51,7 @@ export default defineConfig({
         main: page("index.html"),
         python: page("python.html"),
         psql: page("psql.html"),
+        mongosh: page("mongosh.html"),
       },
     },
   },

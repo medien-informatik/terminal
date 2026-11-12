@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>wterm lokal – mongosh</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { height: 100%; background: #1a1a2e; }
+      #terminal { height: 100%; }
+    </style>
+
+    <!--
+      JavaScript im mongosh-Stil, das vor dem Start der Shell ausgeführt wird
+      (in Dokumentreihenfolge). Möglich sind Inline-Code oder src="datei.js".
+      "use name" am Zeilenanfang wechselt die Datenbank; die zuletzt gewählte
+      Datenbank ist beim Start aktiv (oder data-db am #terminal).
+      data-name legt den Namen für Fehlermeldungen und für load() fest.
+    -->
+    <script type="text/mongosh" data-name="schema.js">
+      use shop
+
+      db.createCollection("kunden");
+      db.kunden.createIndex({ email: 1 }, { unique: true });
+      db.bestellungen.createIndex({ kunde_id: 1 });
+    </script>
+    <script type="text/mongosh" data-name="daten.js">
+      use shop
+
+      db.kunden.insertMany([
+        { _id: 1, name: "Ada Lovelace", email: "ada@example.org", stadt: "London", tags: ["mathematik", "pionierin"] },
+        { _id: 2, name: "Konrad Zuse", email: "konrad@example.org", stadt: "Berlin", tags: ["ingenieur"] },
+        { _id: 3, name: "Grace Hopper", email: "grace@example.org", stadt: "New York", tags: ["compiler", "navy"] },
+      ]);
+
+      db.bestellungen.insertMany([
+        { kunde_id: 1, artikel: "Rechenschieber", menge: 2, preis: 19.9, datum: ISODate("2026-01-15T10:00:00Z") },
+        { kunde_id: 2, artikel: "Relais", menge: 120, preis: 0.45, datum: ISODate("2026-02-03T09:30:00Z") },
+        { kunde_id: 2, artikel: "Lochstreifen", menge: 10, preis: 3.2, datum: ISODate("2026-02-04T14:15:00Z") },
+        { kunde_id: 3, artikel: "Compiler-Handbuch", menge: 1, preis: 49.0, datum: ISODate("2026-03-01T08:00:00Z") },
+      ]);
+    </script>
+  </head>
+  <body>
+    <div id="terminal"></div>
+    <script type="module" src="/src/mongosh-main.ts"></script>
+  </body>
+</html>

@@ -1,5 +1,11 @@
 # wterm lokal – Terminal-Simulation im Browser mit nano
 
+## TL;DR
+
+ - Live: [mingo](https://medien-informatik.github.io/terminal/python.html)
+
+## Project
+
 Dieses Projekt enthält den benötigten Quellcode von
 [vercel-labs/wterm](https://github.com/vercel-labs/wterm) (Commit `20a1a24`, Apache-2.0,
 siehe `LICENSE`) als eigenständiges Vite-Projekt. Alles läuft **lokal im Browser**:
@@ -23,6 +29,8 @@ siehe `LICENSE`) als eigenständiges Vite-Projekt. Alles läuft **lokal im Brows
 | `python.html`, `src/python-main.ts` | Seite `/python.html`: zusätzlich mit Python |
 | `packages/psql/` | **neu:** `@wterm/psql` – psql-Simulation auf Basis von PGlite |
 | `psql.html`, `src/psql-main.ts` | Seite `/psql.html`: psql direkt (ohne Shell) |
+| `packages/mongosh/` | **neu:** `@wterm/mongosh` – mongosh-Simulation auf Basis von mingo |
+| `mongosh.html`, `src/mongosh-main.ts` | Seite `/mongosh.html`: mongosh direkt (ohne Shell) |
 | `scripts/inline-wasm.mjs` | bettet die WASM-Datei als Base64 ein (läuft automatisch vor `dev`/`build`) |
 | `scripts/copy-pyodide.mjs` | kopiert die Pyodide-Laufzeit nach `public/pyodide/` (automatisch vor `dev`/`build`) |
 
@@ -34,7 +42,7 @@ mit Server (SSH/lokale PTY) und die Tests.
 
 ```bash
 npm install
-npm run dev        # http://127.0.0.1:5173, …/python.html und …/psql.html
+npm run dev        # http://127.0.0.1:5173, …/python.html, …/psql.html und …/mongosh.html
 npm run build      # statischer Build nach dist/ (alle Seiten)
 ```
 
@@ -162,6 +170,56 @@ Alle `<script type="text/sql">` werden in Dokumentreihenfolge ausgeführt, bevor
 Nicht unterstützt: andere Datenbanken als `postgres` (`\c`), `\e`, `\!` (keine Shell), `\copy`,
 Variablen-Ersetzung (`:name`), Tab-Vervollständigung. Lange Abfragen lassen sich nicht abbrechen.
 
+## mongosh (`/mongosh.html`)
+
+Die Seite startet direkt eine **mongosh**-ähnliche Shell, ebenfalls ohne Bash. Einen echten
+MongoDB-Server gibt es im Browser nicht (kein WebAssembly-Build von `mongod`). Abfragen, Updates
+und Aggregationen laufen deshalb lokal mit [mingo](https://github.com/kofrasa/mingo), einer
+Umsetzung der MongoDB-Abfragesprache für Objekte im Arbeitsspeicher. Es ist eine **Simulation**:
+Transaktionen, Benutzer, Replikation und Ausführungspläne fehlen, Randfälle können abweichen.
+
+### Startdaten in der Seite
+
+Alle `<script type="text/mongosh">` werden in Dokumentreihenfolge ausgeführt, bevor die Shell startet:
+
+```html
+<script type="text/mongosh" data-name="daten.js">
+  use shop
+  db.kunden.insertMany([{ _id: 1, name: "Ada" }, { _id: 2, name: "Konrad" }]);
+</script>
+<script type="text/mongosh" src="mehr-daten.js"></script>
+```
+
+- JavaScript wie in mongosh. `use name` am Zeilenanfang wechselt die Datenbank.
+- Beim Start ist die zuletzt gewählte Datenbank aktiv, sonst `test`. Mit
+  `<div id="terminal" data-db="name">` lässt sich das festlegen.
+- Ergebnisse werden nicht angezeigt, Fehler schon. `load("daten.js")` führt ein Skript erneut aus.
+
+### Was die Shell kann
+
+- Prompt `test>`, Fortsetzung `...` bei offenen Klammern/Strings, Verlauf mit ↑/↓,
+  Strg+C verwirft die Eingabe, zweimal Strg+C, Strg+D oder `exit` beendet.
+- Ausgabe wie mongosh: `ObjectId('…')`, `ISODate('…')`, kurze Dokumente einzeilig, Farben,
+  `find()` zeigt 20 Dokumente, danach `Type "it" for more`.
+- Shell-Befehle: `use`, `show dbs|databases`, `show collections|tables`, `it`, `help`, `cls`,
+  `exit`/`quit`; Funktionen `print`, `printjson`, `load`, `sleep`, `ObjectId`, `ISODate`,
+  `NumberInt`/`NumberLong`/`NumberDecimal`.
+- Datenbank: `db.getName()`, `getCollection`, `getCollectionNames`, `createCollection`,
+  `dropDatabase`, `getSiblingDB`, `stats`, `runCommand` (u. a. `ping`, `listCollections`), `help()`.
+- Collections: `insertOne/insertMany`, `find`/`findOne` (Filter, Projektion, Optionen),
+  `countDocuments`, `estimatedDocumentCount`, `distinct`, `updateOne/updateMany/replaceOne`
+  (inkl. `upsert`, `$setOnInsert`, `arrayFilters`, Pipeline-Updates), `deleteOne/deleteMany`,
+  `findOneAndUpdate/Replace/Delete`, `bulkWrite`, `aggregate` (alle mingo-Stufen, z. B. `$group`,
+  `$lookup`, `$unwind`, `$facet`, `$out`, `$merge`), `createIndex` (`unique` wird geprüft:
+  `E11000 duplicate key error`), `getIndexes`, `dropIndex`, `drop`, `renameCollection`.
+- Cursor: `sort`, `skip`, `limit`, `project`, `toArray`, `forEach`, `map`, `count`, `hasNext`/`next`.
+- Variablen bleiben zwischen Eingaben erhalten (auch `let`/`const`); `await` ist erlaubt, aber
+  wirkungslos, weil die Shell-API synchron arbeitet.
+
+Nicht unterstützt: Verbindungen zu echten Servern, Transaktionen/Sessions, Benutzer und Rollen,
+Change Streams, GridFS, Tab-Vervollständigung. Indexe (außer `unique`) beschleunigen nichts.
+Die Daten liegen im Arbeitsspeicher und sind nach dem Neuladen weg.
+
 ## Umgebungsvariablen
 
 Die Shell merkt sich Variablen über Befehlszeilen hinweg, wie eine echte Bash:
@@ -183,7 +241,8 @@ dabei unverändert.
 
 Der Build ist rein statisch (`dist/`, ca. 31 MB inkl. Pyodide und PGlite) und nutzt relative Pfade
 (`base: "./"` in `vite.config.ts`). Er funktioniert daher unter jedem Unterpfad, z. B.
-`https://medien-informatik.github.io/terminal/`, `…/terminal/python.html` und `…/terminal/psql.html`.
+`https://medien-informatik.github.io/terminal/`, `…/terminal/python.html`, `…/terminal/psql.html` und
+`…/terminal/mongosh.html`.
 
 Der Workflow [`.github/workflows/pages.yml`](.github/workflows/pages.yml) baut bei jedem Push auf
 `main` (oder manuell über „Run workflow“) mit Node 24 und veröffentlicht `dist/`.

@@ -30,6 +30,9 @@
       ],
       "@wterm/psql": [
         "./packages/psql/src/index.ts"
+      ],
+      "@wterm/mongosh": [
+        "./packages/mongosh/src/index.ts"
       ]
     }
   },
